@@ -348,7 +348,7 @@ def train(total_episodes: int, resume_path: str | None = None, use_bc: bool = Fa
         if ep < TEACHER_PHASE_EP: opponent = teacher
         elif ep < MIXED_PHASE_EP: opponent = teacher if random.random() < 0.5 else population.get_random_agent(action_dim)
         else: opponent = population.get_random_agent(action_dim)
-        
+
         env.set_agents([agent, opponent])
 
         bankrolls = [START_BANKROLL, START_BANKROLL]
@@ -641,7 +641,7 @@ def run_match(env, agent, opponent, mode: str):
     """Runs a full match for demo or play, handling bankrolls."""
     bankrolls = [START_BANKROLL, START_BANKROLL]
     num_hands = 0
-    
+
     while True: # Match loop
         if any(b <= 0 for b in bankrolls):
             break
