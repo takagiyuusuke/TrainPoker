@@ -52,7 +52,7 @@ LAMBDA_FULL_EP        =     0
 SURVIVE_BONUS         =       0.01
 MAX_HANDS             =     10000
 BC_HANDS              =   100_000
-BC_EPOCHS             =        5
+BC_EPOCHS             =        10
 BC_BATCH              =     1_024
 
 CHECKPOINT_DIR = Path("checkpoints")
@@ -218,7 +218,7 @@ class DQNAgent:
         loss.backward()
         nn.utils.clip_grad_norm_(self.policy_net.parameters(), GRAD_CLIP)
         self.optimizer.step()
-        
+
         self.updates_done += 1
         if self.updates_done % TARGET_UPDATE == 0:
             self.target_net.load_state_dict(self.policy_net.state_dict())
@@ -278,7 +278,7 @@ class Population:
 # ───────── BC ─────────
 def collect_bc_data(num_hands: int) -> List[Tuple[dict, int]]:
     # 3人環境で全員ルールベース
-    env = rlcard.make('limit-holdem', config={'seed': SEED, 'num_players': 3})
+    env = rlcard.make('limit-holdem', config={'seed': SEED, 'game_num_players': 3})
     teacher1 = LimitholdemRuleAgentV1()
     teacher2 = LimitholdemRuleAgentV1()
     teacher3 = LimitholdemRuleAgentV1()
@@ -322,7 +322,7 @@ def train_bc(net: QNet, data: List[Tuple[dict, int]]):
 
 def train(total_episodes: int, resume_path: str | None = None, use_bc: bool = False):
     # 3人環境でDQN+2ルールベース
-    env = rlcard.make('limit-holdem', config={'seed': SEED, 'num_players': 3})
+    env = rlcard.make('limit-holdem', config={'seed': SEED, 'game_num_players': 3})
     action_dim = env.num_actions
     agent = DQNAgent(action_dim)
     teacher1 = LimitholdemRuleAgentV1()
@@ -481,12 +481,13 @@ def ascii_render_state(env, obs: dict, current_player_id: int):
     pot_amount = sum(p.in_chips for p in env.game.players)
     print(f"├{'─'*W}┤\n│ Pot: {pot_amount:<10.0f}{'':<{W-16}}│\n└{'─'*W}┘")
 
+
 # --- Evaluation ---
 def evaluate(num_matches: int, checkpoint_path: Path):
     """Evaluates the agent's performance over a number of full matches.
     追加でハンドあたりのペイオフ分布、平均・標準偏差・信頼区間などを算出します。
     """
-    env = rlcard.make('limit-holdem', config={'seed': SEED + 42})
+    env = rlcard.make('limit-holdem', config={'seed': SEED + 42, 'game_num_players': 3})
     agent = DQNAgent(env.num_actions); agent.load_checkpoint(checkpoint_path)
     teacher = LimitholdemRuleAgentV1()
     env.set_agents([agent, teacher])
@@ -607,65 +608,75 @@ def evaluate(num_matches: int, checkpoint_path: Path):
     print(f"Match-level total EV (BB単位): mean {mean_match_bb:.2f} ± {ci_match_half:.2f} (95% CI), std {std_match_bb:.2f}")
 
 # --- Demo & Play (Match-based) ---
-def run_match(env, agent, opponent, mode: str):
-    """Runs a full match for demo or play, handling bankrolls."""
-    bankrolls = [START_BANKROLL, START_BANKROLL]
+def run_match(env, agents: List, mode: str):
+    bankrolls = [START_BANKROLL for _ in range(env.num_players)]
     num_hands = 0
+    print(f"=== Num Players: {env.num_players} ===")
+    print(f"Agents: {env.agents}")
 
-    while True: # Match loop
+
+    while True:
         if any(b <= 0 for b in bankrolls):
             break
         obs, current_player_id = env.reset()
-        # [FIX] Set stacks at the start of each hand from the persistent bankroll
         for i in range(env.num_players):
             env.game.players[i].stack = bankrolls[i]
-        obs = env.get_state(current_player_id) # Re-fetch state after setting stacks
-
+        obs = env.get_state(current_player_id)
         ascii_render_state(env, obs, current_player_id)
-        
-        while not env.is_over(): # Hand loop
-            if current_player_id == 0: # Agent's turn
-                legal_actions = list(obs['legal_actions'].keys())
-                state_vec = extract_state(obs['raw_obs'])
-                action_id = agent.select_action(state_vec, legal_actions, is_greedy=True)
+
+        while not env.is_over():
+            current_agent = agents[current_player_id]
+
+            if isinstance(current_agent, UserAgent):
+                action_id = current_agent.step(obs)
                 action_name = map_id_to_name(obs, action_id)
-                print(f"\n>> Agent plays: {action_name} (id={action_id})\n")
-            else: # Opponent's turn (Human or Rule-based)
+                print(f"\n>> User (P{current_player_id}) plays: {action_name} (id={action_id})\n")
+
+            elif isinstance(current_agent, DQNAgent):
+                state_vec = extract_state(obs['raw_obs'])
+                legal_actions = list(obs['legal_actions'].keys())
+                action_id = current_agent.select_action(state_vec, legal_actions, is_greedy=True)
+                action_name = map_id_to_name(obs, action_id)
+                print(f"\n>> DQNAgent (P{current_player_id}) plays: {action_name} (id={action_id})\n")
+
+            else:  # Rule-based or other type of agent
                 if mode == 'play':
-                    action_id = opponent.step(obs)
-                else: # Demo mode
-                    action_obj = opponent.step(obs)
+                    action_id = current_agent.step(obs)
+                else:  # demo mode
+                    action_obj = current_agent.step(obs)
                     action_name_str = action_obj.name if hasattr(action_obj, 'name') else action_obj
                     action_id = map_action_to_id(obs, action_name_str)
-                    if action_id is None: 
+                    if action_id is None:
                         action_id = random.choice(list(obs['legal_actions'].keys()))
-                    action_name = map_id_to_name(obs, action_id)
-                    print(f"\n>> Opponent plays: {action_name} (id={action_id})\n")
+                action_name = map_id_to_name(obs, action_id)
+                print(f"\n>> Agent (P{current_player_id}) plays: {action_name} (id={action_id})\n")
 
             obs, current_player_id = env.step(action_id)
             ascii_render_state(env, obs, current_player_id)
 
+        # 勝敗計算とbankroll更新
         units = env.get_payoffs()
         BIG_BLIND = env.game.small_blind * 2
         payoffs_chips = [float(u) * BIG_BLIND for u in units]
         print(f"\n** Hand Over ** Payoffs (chips): {payoffs_chips}\n")
-        # bankrolls を実チップ差で更新
+
         for i in range(env.num_players):
             bankrolls[i] += payoffs_chips[i]
         num_hands += 1
 
         if any(b <= 0 for b in bankrolls) or num_hands >= MAX_HANDS:
             print("=== Match Over ===")
-            print(f"Final Bankrolls: P0={bankrolls[0]:.0f}, P1={bankrolls[1]:.0f}")
-            if bankrolls[0] > bankrolls[1]:
-                print("Agent Won the Match!")
-            elif bankrolls[1] > bankrolls[0]:
-                print("Opponent Won the Match!")
+            for i, b in enumerate(bankrolls):
+                print(f"Final Bankroll (P{i}): {b:.0f}")
+            winners = [i for i, b in enumerate(bankrolls) if b == max(bankrolls)]
+            if len(winners) == 1:
+                print(f"Player {winners[0]} Won the Match!")
             else:
                 print("The Match is a Draw!")
             break
-        
+
         input("Press Enter to start next hand...")
+
 
 
 class UserAgent:
@@ -692,28 +703,31 @@ def main():
     p.add_argument('--play', action='store_true', help="Play against a trained agent.")
     args = p.parse_args()
 
-    # ck_path = Path(args.resume) if args.resume else find_latest_checkpoint()
+    ck_path = Path(args.resume) if args.resume else find_latest_checkpoint()
     if any([args.eval, args.demo, args.play]) and (not ck_path or not ck_path.is_file()):
         print(f"!! Error: Checkpoint not found at '{ck_path}'. Please train first or provide a valid path via --resume.")
         return
 
     if args.demo:
         print(f"Running demo with {ck_path}")
-        env = rlcard.make('limit-holdem', config={'seed': SEED, 'num_players': 3})
+        env = rlcard.make('limit-holdem', config={'seed': SEED, 'game_num_players': 3})
         agent = DQNAgent(env.num_actions); agent.load_checkpoint(ck_path)
-        opponent = LimitholdemRuleAgentV1()
-        env.set_agents([agent, opponent])
-        run_match(env, agent, opponent, 'demo')
+        opponent1 = LimitholdemRuleAgentV1()
+        opponent2 = LimitholdemRuleAgentV1()
+        env.set_agents([agent, opponent1, opponent2])
+        run_match(env, [agent, opponent1, opponent2], 'demo')
     elif args.eval:
         print(f"Evaluating {ck_path}")
         evaluate(args.eval_matches, ck_path)
     elif args.play:
         print(f"Playing against {ck_path}")
-        env = rlcard.make('limit-holdem')
-        agent = DQNAgent(env.num_actions); agent.load_checkpoint(ck_path)
-        opponent = UserAgent()
-        env.set_agents([agent, opponent])
-        run_match(env, agent, opponent, 'play')
+        env = rlcard.make('limit-holdem', config={'seed': SEED, 'game_num_players': 3})
+
+        user = UserAgent()
+        opponent1 = DQNAgent(env.num_actions); opponent1.load_checkpoint(ck_path)
+        opponent2 = DQNAgent(env.num_actions); opponent2.load_checkpoint(ck_path)
+        env.set_agents([user, opponent1, opponent2])
+        run_match(env, [user, opponent1, opponent2], 'play')
     else:
         train(args.episodes, args.resume, use_bc=args.bc)
 
